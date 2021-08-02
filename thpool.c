@@ -157,8 +157,8 @@ thpool_worker_sa_handler_pause(int sig_id) {
     if(!tp)
         return;
 
-    // NOTE: cannot use  condition variable because only async-signal-safe
-    // functions are allowed.
+    // NOTE: cannot use a condition variable because only async-signal-safe
+    // functions are allowed in a signal handler.
     while(tp->pause)
         sleep(1);
 }
@@ -197,7 +197,7 @@ thpool_worker(Thread* t) {
     struct sigaction sig_info;
     sigset_t block_mask;
     sigemptyset(&block_mask);
-    sigaddset (&block_mask, SIGUSR2); // block signals for hard shutdown
+    sigaddset(&block_mask, SIGUSR2); // block signals for hard shutdown
     sig_info.sa_mask = block_mask;
     sig_info.sa_flags = 0;
     sig_info.sa_handler = thpool_worker_sa_handler_pause;
@@ -206,7 +206,7 @@ thpool_worker(Thread* t) {
     }
 
     sigemptyset(&block_mask);
-    sigaddset (&block_mask, SIGUSR1); // block signals for pause
+    sigaddset(&block_mask, SIGUSR1); // block signals for pause
     sig_info.sa_mask = block_mask;
     sig_info.sa_handler = thpool_worker_sa_handler_terminate;
     if(sigaction(SIGUSR2, &sig_info, NULL)) {
@@ -218,8 +218,9 @@ thpool_worker(Thread* t) {
     if(pthread_mutex_lock(&tp->lock))
         return NULL;
 
-    if( (tp->init_capacity == ++(tp->thnum_alive)) &&
-        pthread_cond_signal(&tp->th_init_done)) {
+    tp->thnum_alive++;
+
+    if(pthread_cond_signal(&tp->th_init_done)) {
         tp->thnum_alive--;
         pthread_mutex_unlock(&tp->lock);
         return NULL;
@@ -311,13 +312,57 @@ thpool_worker(Thread* t) {
         }
     }
 
-    // terminating anyway; no need to check return values of pthread lib calls.
-    pthread_mutex_lock(&tp->lock);
+    if(pthread_mutex_lock(&tp->lock))
+        return NULL;
+
     tp->thnum_alive--;
     assert(tp->thnum_alive >= 0);
+
+    // terminating anyway; no need to check return value
     pthread_mutex_unlock(&tp->lock);
 
     return NULL;
+}
+
+/* usage: subroutine of thpool_create(). Wait until threads created earlier are
+ *      initialized, then perform a soft shutdown.
+ * params:
+ *      1) tp: ptr to Threadpool
+ *      2) n: the number of threads that has been created
+ * return: 0 on success; non-zero on error */
+static inline int
+thpool_worker_init_abort(Threadpool* tp, int64_t n) {
+    if(!n)
+        return 0;
+
+    if(pthread_mutex_lock(&tp->lock))
+        return Threadpool_lock_fail;
+
+    while(tp->thnum_alive < n) {
+        if(pthread_cond_wait(&tp->th_init_done, &tp->lock)) {
+            pthread_mutex_unlock(&tp->lock);
+            return Threadpool_cond_fail;
+        }
+    }
+
+    tp->shutdown = 1; // do a soft shutdown
+
+    if(pthread_mutex_unlock(&tp->lock))
+        return Threadpool_lock_fail;
+
+    // wake up all workers
+    if(pthread_cond_broadcast(&tp->worker_event))
+        return Threadpool_cond_fail;
+
+    for(int64_t i = 0; i < n; ++i) {
+        if(pthread_join(tp->threads[i].pthread, NULL))
+            return Threadpool_join_fail;
+    }
+
+    assert(tp->thnum_alive == 0);
+    assert(tp->thnum_active == 0);
+
+    return 0;
 }
 
 /* usage: create and initialize a threadpool; A process may only create one
@@ -341,18 +386,54 @@ thpool_create(int64_t n) {
         return NULL;
 
     pthread_mutexattr_t lock_attr; // use a robust lock
-    if(pthread_mutexattr_init(&lock_attr) ||
-       pthread_mutexattr_setrobust(&lock_attr, PTHREAD_MUTEX_ROBUST) ||
-       pthread_mutex_init(&tp->lock, &lock_attr) ||
-       pthread_cond_init(&tp->worker_event, NULL) ||
-       pthread_cond_init(&tp->queue_not_full, NULL) ||
-       pthread_cond_init(&tp->th_all_idle, NULL) ||
-       pthread_cond_init(&tp->th_init_done, NULL) ||
-       pthread_mutexattr_destroy(&lock_attr)) {
+    if(pthread_mutexattr_init(&lock_attr)) {
+        free(tp);
+        return NULL;
+    }
+
+    if(pthread_mutexattr_setrobust(&lock_attr, PTHREAD_MUTEX_ROBUST) ||
+       pthread_mutex_init(&tp->lock, &lock_attr)) {
+        pthread_mutexattr_destroy(&lock_attr);
+        free(tp);
+        return NULL;
+    }
+
+    if(pthread_mutexattr_destroy(&lock_attr)) {
+        pthread_mutex_destroy(&tp->lock);
+        free(tp);
+        return NULL;
+    }
+
+    if(pthread_cond_init(&tp->worker_event, NULL)) {
+        pthread_mutex_destroy(&tp->lock);
         free(tp);
         return NULL;
     }
     
+    if(pthread_cond_init(&tp->queue_not_full, NULL)) {
+        pthread_cond_destroy(&tp->worker_event);
+        pthread_mutex_destroy(&tp->lock);
+        free(tp);
+        return NULL;
+    }
+
+    if(pthread_cond_init(&tp->th_all_idle, NULL)) {
+        pthread_cond_destroy(&tp->queue_not_full);
+        pthread_cond_destroy(&tp->worker_event);
+        pthread_mutex_destroy(&tp->lock);
+        free(tp);
+        return NULL;
+    }
+
+    if(pthread_cond_init(&tp->th_init_done, NULL)) {
+        pthread_cond_destroy(&tp->th_all_idle);
+        pthread_cond_destroy(&tp->queue_not_full);
+        pthread_cond_destroy(&tp->worker_event);
+        pthread_mutex_destroy(&tp->lock);
+        free(tp);
+        return NULL;
+    }
+
     tp->shutdown = 0;
     tp->pause = 0;
     tp->jobqueue_len = 0;
@@ -370,27 +451,38 @@ thpool_create(int64_t n) {
         if(pthread_create(&tp->threads[i].pthread, NULL,
                           (void* (*) (void*)) thpool_worker,
                           (void*) (tp->threads + i))) {
-            // TODO: kill pthreads created earlier in the loop on error
+            if(thpool_worker_init_abort(tp, i)) {
+                // NOTE: cannot release lock and condition vars in this case
+                return NULL;
+            }
+            pthread_cond_destroy(&tp->th_all_idle);
+            pthread_cond_destroy(&tp->queue_not_full);
+            pthread_cond_destroy(&tp->worker_event);
+            pthread_mutex_destroy(&tp->lock);
             free(tp);
             return NULL;
         }
     }
     
     if(pthread_mutex_lock(&tp->lock)) {
-        free(tp);
+        // fail to acquire the lock already, calling thpool_worker_init_abort()
+        // makes no sense
+        // NOTE: cannot destory the condition vars in this case
         return NULL;
     }
 
     while(tp->thnum_alive != n) {
         if(pthread_cond_wait(&tp->th_init_done, &tp->lock)) {
+            // th_init_done malfunctions already, calling
+            // thpool_worker_init_abort() makes no sense
             pthread_mutex_unlock(&tp->lock);
-            free(tp);
             return NULL;
         }
     }
 
     if(pthread_mutex_unlock(&tp->lock)) {
-        free(tp);
+        // fail to unlock the lock already; cannot call
+        // thpool_worker_init_abort()
         return NULL;
     }
 
@@ -587,15 +679,17 @@ thpool_resume(Threadpool* tp) {
 }
 
 /* usage: Given a threadpool, kill all its workers. Note that there might be
- *      unexecuted jobs left in the pool and the states of some mutex and
- *      condition variable in the pool can be undefined. If the function
- *      encounter errors when killing the workers, it returns a non-zero value
- *      and may leave some workers alive. The threadpool becomes inoperable
- *      after this function returns and the only valid function call left is
- *      thpool_destroy().
+ *      unexecuted jobs left in the pool and the states of resouces (e.g. mutex
+ *      and condition variable) accessed in the job can be undefined.
  *
- *      If the workers are paused and not resumed, this function will resume
- *      the workers before killing them.
+ *      If this function encounter errors when killing the workers, it returns a
+ *      non-zero value and may leave some workers alive.
+ *
+ *      The threadpool becomes inoperable after this function returns and the
+ *      only valid function call left is thpool_destroy().
+ *
+ *      If the workers are paused and not yet resumed, this function will
+ *      resume the workers before killing them.
  * params:
  *      1) tp: ptr to threadpool 
  * return : 0 on success; non-zero value on error */
@@ -666,8 +760,8 @@ thpool_hard_shutdown(Threadpool* tp) {
  *      becomes inoperable after this function returns and the only valid
  *      function call left is thpool_destroy().
  *
- *      If the workers are paused and not resumed, this function will resume
- *      the workers before shutting them down.
+ *      If the workers are paused and not yet resumed, this function will
+ *      resume the workers before shutting them down.
  * params:
  *      1) tp: ptr to threadpool
  * return: 0 on success; non-zero value on error */
@@ -713,8 +807,10 @@ thpool_soft_shutdown(Threadpool* tp) {
 
 /* usage: Given a threadpool, terminate all its workers and release its
  *      resources. The terminination can be soft or hard:
- *              soft: wait until all workers finish their current jobs
- *              hard: terminate the workers immediately without waiting
+ *
+ *      soft: wait until all workers finish their current jobs
+ *      hard: terminate the workers immediately without waiting
+ *
  *      Hard terminination might leave system resources accessed or allocated
  *      in user supplied jobs in an undefined state, and should be used as a
  *      last resort.

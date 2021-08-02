@@ -89,15 +89,17 @@ int
 thpool_resume(Threadpool* tp);
 
 /* usage: Given a threadpool, kill all its workers. Note that there might be
- *      unexecuted jobs left in the pool and the states of some mutex and
- *      condition variable in the pool can be undefined. If the function
- *      encounter errors when killing the workers, it returns a non-zero value
- *      and may leave some workers alive. The threadpool becomes inoperable
- *      after this function returns and the only valid function call is
- *      thpool_destroy().
+ *      unexecuted jobs left in the pool and the states of resouces (e.g. mutex
+ *      and condition variable) accessed in the job can be undefined.
  *
- *      If the workers are paused and not resumed, this function will resume
- *      the workers before killing them.
+ *      If this function encounter errors when killing the workers, it returns a
+ *      non-zero value and may leave some workers alive.
+ *
+ *      The threadpool becomes inoperable after this function returns and the
+ *      only valid function call left is thpool_destroy().
+ *
+ *      If the workers are paused and not yet resumed, this function will
+ *      resume the workers before killing them.
  * params:
  *      1) tp: ptr to threadpool 
  * return : 0 on success; non-zero value on error */
@@ -106,8 +108,10 @@ thpool_hard_shutdown(Threadpool* tp);
 
 /* usage: Given a threadpool, terminate all its workers and release its
  *      resources. The terminination can be soft or hard:
- *              soft: wait until all workers finish their current jobs
- *              hard: terminate the workers immediately without waiting
+ *
+ *      soft: wait until all workers finish their current jobs
+ *      hard: terminate the workers immediately without waiting
+ *
  *      Hard terminination might leave system resources accessed or allocated
  *      in user supplied jobs in an undefined state, and should be used as a
  *      last resort.
