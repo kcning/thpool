@@ -37,9 +37,6 @@ struct Threadpool {
     pthread_cond_t th_all_idle;
     pthread_cond_t th_init_done;
 
-    pthread_mutex_t pause_lock;
-    pthread_cond_t pause_wakeup;
-
     volatile int64_t shutdown;
     volatile int64_t pause;
 
@@ -160,16 +157,10 @@ thpool_worker_sa_handler_pause(int sig_id) {
     if(!tp)
         return;
 
-    if(pthread_mutex_lock(&tp->pause_lock))
-        return;
-
-    while(tp->pause) {
-        // TODO: how about pthread_cond_timedwait()?
-        if(pthread_cond_wait(&tp->pause_wakeup, &tp->pause_lock))
-            break; // just unlock pause_lock and return
-    }
-
-    pthread_mutex_unlock(&tp->pause_lock);
+    // NOTE: cannot use  condition variable because only async-signal-safe
+    // functions are allowed.
+    while(tp->pause)
+        sleep(1);
 }
 
 /* usage: signal handler for thpool_worker; on SIGUSR2, terminate the thread */
@@ -179,13 +170,6 @@ thpool_worker_sa_handler_terminate(int sig_id) {
     
     Threadpool* tp = g_tp_handle;
     if(!tp)
-        return;
-
-    // try to release the lock in case this thread currently owns it.  If the
-    // thread is not the owner, the function should only return EPERM since the
-    // lock is robust and should not trigger a deadlock.
-    int rv = pthread_mutex_unlock(&tp->lock);
-    if(rv && rv != EPERM)
         return;
 
     // find the Thread data structure for this thread; just do
@@ -252,6 +236,17 @@ thpool_worker(Thread* t) {
     jmp_buf env;
     t->envp = &env;
     int jmp_v = setjmp(env);
+
+    if(jmp_v) { // return from signal handler for SIGUSR2
+        // try to release the lock in case this thread currently owns it.  If the
+        // thread is not the owner, the function should only return EPERM since the
+        // lock is robust and should not trigger a deadlock. Note that this
+        // cannot be performed inside the signal handler because
+        // pthread_mutex_unlock() is not async-signal-safe.
+        int rv = pthread_mutex_unlock(&tp->lock);
+        if(rv && rv != EPERM)
+            return NULL;
+    }
 
     while(!jmp_v) {
         if(pthread_mutex_lock(&tp->lock)) {
@@ -353,8 +348,6 @@ thpool_create(int64_t n) {
        pthread_cond_init(&tp->queue_not_full, NULL) ||
        pthread_cond_init(&tp->th_all_idle, NULL) ||
        pthread_cond_init(&tp->th_init_done, NULL) ||
-       pthread_mutex_init(&tp->pause_lock, NULL) ||
-       pthread_cond_init(&tp->pause_wakeup, NULL) ||
        pthread_mutexattr_destroy(&lock_attr)) {
         free(tp);
         return NULL;
@@ -542,12 +535,12 @@ thpool_pause(Threadpool* tp) {
     if(shutdown)
         return Threadpool_shutdown;
 
-    if(pthread_mutex_lock(&tp->pause_lock))
+    if(pthread_mutex_lock(&tp->lock))
         return Threadpool_lock_fail;
 
-    tp->pause = 1;
+    tp->pause = 1; // NOTE: the workers do not modify it
 
-    if(pthread_mutex_unlock(&tp->pause_lock))
+    if(pthread_mutex_unlock(&tp->lock))
         return Threadpool_lock_fail;
 
     for(int64_t i = 0; i < tp->init_capacity; ++i) {
@@ -557,10 +550,6 @@ thpool_pause(Threadpool* tp) {
         else if(rv)
             return Threadpool_kill_fail;
     }
-
-    // wake up all workers
-    if(pthread_cond_broadcast(&tp->worker_event))
-        return Threadpool_cond_fail;
 
     return 0;
 }
@@ -586,16 +575,13 @@ thpool_resume(Threadpool* tp) {
     if(shutdown)
         return Threadpool_shutdown;
 
-    if(pthread_mutex_lock(&tp->pause_lock))
+    if(pthread_mutex_lock(&tp->lock))
         return Threadpool_lock_fail;
 
-    tp->pause = 0;
+    tp->pause = 0; // NOTE: the workers do not modify it
 
-    if(pthread_mutex_unlock(&tp->pause_lock))
+    if(pthread_mutex_unlock(&tp->lock))
         return Threadpool_lock_fail;
-
-    if(pthread_cond_broadcast(&tp->pause_wakeup))
-        return Threadpool_cond_fail;
 
     return 0;
 }
@@ -767,9 +753,7 @@ thpool_destroy(Threadpool* tp, bool type) {
        pthread_cond_destroy(&tp->worker_event) ||
        pthread_cond_destroy(&tp->queue_not_full) ||
        pthread_cond_destroy(&tp->th_all_idle) ||
-       pthread_cond_destroy(&tp->th_init_done) ||
-       pthread_mutex_destroy(&tp->pause_lock) ||
-       pthread_cond_destroy(&tp->pause_wakeup))
+       pthread_cond_destroy(&tp->th_init_done))
         return Threadpool_free_fail;
 
     g_tp_handle = NULL; // reset the global handle
