@@ -455,6 +455,7 @@ thpool_create(int64_t n) {
                 // NOTE: cannot release lock and condition vars in this case
                 return NULL;
             }
+            pthread_cond_destroy(&tp->th_init_done);
             pthread_cond_destroy(&tp->th_all_idle);
             pthread_cond_destroy(&tp->queue_not_full);
             pthread_cond_destroy(&tp->worker_event);
